@@ -32,7 +32,7 @@
 #define ARR_SZ(a) (sizeof(a) / sizeof((a)[0]))
 
 static const char *k_hello_name = "hello";
-static const char *k_hello_str = "hello from raw /dev/fuse demo\n";
+static char k_hello_str[512];
 static volatile sig_atomic_t g_stop;
 static volatile sig_atomic_t g_sigint_count;
 
@@ -59,6 +59,15 @@ static long long monotonic_ms(void)
 	if (clock_gettime(CLOCK_MONOTONIC, &ts) < 0)
 		return -1;
 	return (long long)ts.tv_sec * 1000LL + ts.tv_nsec / 1000000LL;
+}
+
+static void set_hello_str(pid_t worker_pid)
+{
+	snprintf(k_hello_str, sizeof(k_hello_str),
+		 "hello from raw /dev/fuse demo (worker pid=%ld)\n"
+		 "Try: kill -9 %ld\n"
+		 "Or press Ctrl+C in the other terminal running this demo to stop the keeper process.\n",
+		 (long)worker_pid, (long)worker_pid);
 }
 
 static int clone_fuse_dev_fd(int master_fd)
@@ -402,6 +411,7 @@ int main(int argc, char **argv)
 		return 2;
 	}
 	mountpoint = argv[1];
+	set_hello_str(getpid());
 	if (getenv("MAX_RESTARTS"))
 		max_restarts = atoi(getenv("MAX_RESTARTS"));
 
@@ -462,6 +472,7 @@ int main(int argc, char **argv)
 			close(sv[1]);
 			if (fd < 0)
 				_Exit(2);
+			set_hello_str(getpid());
 			LOGF("worker got fd=%d", fd);
 			_Exit(worker_loop(fd));
 		}
