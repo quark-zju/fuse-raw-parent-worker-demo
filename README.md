@@ -63,7 +63,7 @@ When killing a worker with `SIGKILL`:
 
 1. Some in-flight operations may fail once (typically visible as I/O errors in
    client syscalls that were already outstanding).
-2. Parent logs worker death, sends `FUSE_NOTIFY_RESEND`, and spawns new worker.
+2. Parent logs worker death and spawns new worker (no resend in current build).
 3. New requests should be handled by the new worker.
 
 If you see persistent errors after restart, check whether they are new requests

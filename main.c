@@ -145,19 +145,6 @@ static int send_err(int fd, uint64_t unique, int err)
 	return send_out_iov(fd, -err, unique, NULL, 0);
 }
 
-static int send_notify_resend(int fd)
-{
-	struct fuse_out_header oh = {
-		.len = sizeof(oh),
-		.error = FUSE_NOTIFY_RESEND,
-		.unique = 0,
-	};
-
-	if (write(fd, &oh, sizeof(oh)) != (ssize_t)sizeof(oh))
-		return -1;
-	return 0;
-}
-
 static size_t add_dirent(char *dst, size_t cap, off_t off, uint64_t ino,
 			 const char *name, unsigned type)
 {
@@ -467,12 +454,10 @@ int main(int argc, char **argv)
 		else
 			LOGF("worker pid=%ld exited status=%d", (long)worker_pid, WEXITSTATUS(st));
 
-		if (!g_stop) {
-			if (send_notify_resend(master_fd) == 0)
-				LOGF("sent FUSE_NOTIFY_RESEND");
-			else
-				LOGF("FUSE_NOTIFY_RESEND failed err=%d (%s)", errno, strerror(errno));
-		}
+		/*
+		 * Intentionally disabled: resend can replay old unique/node state and
+		 * makes inode-lifecycle handling much more complex after worker crash.
+		 */
 
 		restarts++;
 		worker_pid = -1;
