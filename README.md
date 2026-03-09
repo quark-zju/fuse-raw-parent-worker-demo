@@ -54,24 +54,18 @@ Kernel pointers:
 
 ## RESEND Policy (Current Repo)
 
-`FUSE_NOTIFY_RESEND` is intentionally **disabled** in this repo.
+RESEND is intentionally **not used** in this repo.
 
 Reason:
 - It can replay old request identity/state across worker generations.
 - In complex filesystems this interacts badly with inode lifecycle/reuse and
   increases correctness burden.
+- To avoid ambiguity, `FUSE_HAS_RESEND` is also not advertised during `FUSE_INIT`.
 
 Current policy is simpler and explicit:
 1. Crash-window in-flight requests may fail.
 2. New worker serves new requests.
 3. No replay of pre-crash requests.
-
-Reference pointers (if you later want to re-enable resend):
-- `FUSE_NOTIFY_RESEND` enum: `include/uapi/linux/fuse.h:682`
-- notify dispatch (`unique == 0`): `fs/fuse/dev.c:2200-2205`
-- resend handler: `fs/fuse/dev.c:1991-2033`
-- resend bit: `FUSE_UNIQUE_RESEND` `fuse.h:1017`
-- capability bit: `FUSE_HAS_RESEND` `fuse.h:492`
 
 ## Failure Behavior Cheat Sheet
 
