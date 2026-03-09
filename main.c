@@ -19,6 +19,7 @@
 #include <sys/types.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #ifndef FUSE_DEV_IOC_CLONE
@@ -32,6 +33,7 @@
 static const char *k_hello_name = "hello";
 static const char *k_hello_str = "hello from raw /dev/fuse demo\n";
 static volatile sig_atomic_t g_stop;
+static volatile sig_atomic_t g_sigint_count;
 
 struct fuse_req_view {
 	struct fuse_in_header ih;
@@ -41,8 +43,21 @@ struct fuse_req_view {
 
 static void on_signal(int sig)
 {
-	(void)sig;
-	g_stop = 1;
+	if (sig == SIGTERM) {
+		g_stop = 1;
+		return;
+	}
+	if (sig == SIGINT)
+		g_sigint_count++;
+}
+
+static long long monotonic_ms(void)
+{
+	struct timespec ts;
+
+	if (clock_gettime(CLOCK_MONOTONIC, &ts) < 0)
+		return -1;
+	return (long long)ts.tv_sec * 1000LL + ts.tv_nsec / 1000000LL;
 }
 
 static int clone_fuse_dev_fd(int master_fd)
@@ -377,6 +392,8 @@ int main(int argc, char **argv)
 	pid_t worker_pid = -1;
 	int max_restarts = 0;
 	int restarts = 0;
+	sig_atomic_t handled_sigint = 0;
+	long long last_sigint_ms = -1;
 	const char *mountpoint;
 
 	if (argc != 2) {
@@ -408,8 +425,22 @@ int main(int argc, char **argv)
 		int sv[2];
 		int worker_fd;
 		int st;
+		long long now_ms;
 
 		if (max_restarts > 0 && restarts >= max_restarts)
+			break;
+		while (handled_sigint < g_sigint_count) {
+			now_ms = monotonic_ms();
+			if (last_sigint_ms >= 0 && now_ms >= 0 && now_ms - last_sigint_ms < 1000) {
+				LOGF("SIGINT twice within 1s -> stopping parent");
+				g_stop = 1;
+				break;
+			}
+			last_sigint_ms = now_ms;
+			handled_sigint++;
+			LOGF("SIGINT received: restarting worker; press Ctrl-C again within 1s to stop parent");
+		}
+		if (g_stop)
 			break;
 
 		if (socketpair(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0, sv) < 0)
@@ -423,6 +454,8 @@ int main(int argc, char **argv)
 		}
 		if (worker_pid == 0) {
 			int fd;
+			signal(SIGINT, SIG_DFL);
+			signal(SIGTERM, SIG_DFL);
 			close(sv[0]);
 			fd = recv_fd(sv[1]);
 			close(sv[1]);
@@ -446,8 +479,30 @@ int main(int argc, char **argv)
 		close(worker_fd);
 		close(sv[0]);
 
-		if (waitpid(worker_pid, &st, 0) < 0)
+		for (;;) {
+			if (waitpid(worker_pid, &st, 0) < 0) {
+				if (errno == EINTR) {
+					while (handled_sigint < g_sigint_count) {
+						now_ms = monotonic_ms();
+						if (last_sigint_ms >= 0 && now_ms >= 0 &&
+						    now_ms - last_sigint_ms < 1000) {
+							LOGF("SIGINT twice within 1s -> stopping parent");
+							g_stop = 1;
+							break;
+						}
+						last_sigint_ms = now_ms;
+						handled_sigint++;
+						LOGF("SIGINT received: restarting worker; press Ctrl-C again within 1s to stop parent");
+					}
+					if (g_stop && worker_pid > 0)
+						kill(worker_pid, SIGTERM);
+					if (!g_stop)
+						continue;
+				}
+				goto out;
+			}
 			break;
+		}
 
 		if (WIFSIGNALED(st))
 			LOGF("worker pid=%ld killed by signal=%d", (long)worker_pid, WTERMSIG(st));
@@ -463,6 +518,7 @@ int main(int argc, char **argv)
 		worker_pid = -1;
 	}
 
+out:
 	if (worker_pid > 0)
 		kill(worker_pid, SIGTERM);
 	umount2(mountpoint, MNT_DETACH);
