@@ -88,6 +88,11 @@ make run MOUNTPOINT=/tmp/fuse-clone-demo
 `run` uses `sudo` because this demo calls `mount(2)` directly and typically needs
 `CAP_SYS_ADMIN`.
 
+Signal policy:
+- `SIGINT` (`Ctrl-C`) is treated as a worker-stop signal on first press.
+- If `SIGINT` is pressed twice within 1 second, parent exits and unmounts.
+- `SIGTERM` always stops parent immediately.
+
 ## Crash Test
 
 Shell A:
