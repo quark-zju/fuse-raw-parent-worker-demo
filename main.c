@@ -61,6 +61,33 @@ static long long monotonic_ms(void)
 	return (long long)ts.tv_sec * 1000LL + ts.tv_nsec / 1000000LL;
 }
 
+static int get_env_int(const char *name, int def)
+{
+	const char *s = getenv(name);
+	char *end = NULL;
+	long v;
+
+	if (!s || !*s)
+		return def;
+	errno = 0;
+	v = strtol(s, &end, 10);
+	if (errno != 0 || end == s || *end != '\0' || v < 0 || v > INT32_MAX)
+		return def;
+	return (int)v;
+}
+
+static void sleep_ms(int ms)
+{
+	struct timespec req, rem;
+
+	if (ms <= 0)
+		return;
+	req.tv_sec = ms / 1000;
+	req.tv_nsec = (long)(ms % 1000) * 1000000L;
+	while (nanosleep(&req, &rem) < 0 && errno == EINTR)
+		req = rem;
+}
+
 static void set_hello_str(pid_t worker_pid)
 {
 	snprintf(k_hello_str, sizeof(k_hello_str),
@@ -401,6 +428,7 @@ int main(int argc, char **argv)
 	int master_fd = -1;
 	pid_t worker_pid = -1;
 	int max_restarts = 0;
+	int worker_spawn_delay_ms = 0;
 	int restarts = 0;
 	sig_atomic_t handled_sigint = 0;
 	long long last_sigint_ms = -1;
@@ -412,8 +440,10 @@ int main(int argc, char **argv)
 	}
 	mountpoint = argv[1];
 	set_hello_str(getpid());
-	if (getenv("MAX_RESTARTS"))
-		max_restarts = atoi(getenv("MAX_RESTARTS"));
+	max_restarts = get_env_int("MAX_RESTARTS", 0);
+	worker_spawn_delay_ms = get_env_int("WORKER_SPAWN_DELAY_MS", 0);
+	if (worker_spawn_delay_ms > 0)
+		LOGF("worker spawn delay enabled: %d ms", worker_spawn_delay_ms);
 
 	master_fd = open("/dev/fuse", O_RDWR | O_CLOEXEC);
 	if (master_fd < 0) {
@@ -453,6 +483,10 @@ int main(int argc, char **argv)
 		}
 		if (g_stop)
 			break;
+		if (worker_spawn_delay_ms > 0) {
+			LOGF("sleeping %d ms before spawning worker", worker_spawn_delay_ms);
+			sleep_ms(worker_spawn_delay_ms);
+		}
 
 		if (socketpair(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0, sv) < 0)
 			break;
