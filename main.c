@@ -212,7 +212,7 @@ static int handle_request(int fd, const struct fuse_req_view *rq)
 		out.major = FUSE_KERNEL_VERSION;
 		out.minor = in->minor < FUSE_KERNEL_MINOR_VERSION ? in->minor : FUSE_KERNEL_MINOR_VERSION;
 		out.max_readahead = in->max_readahead;
-		flags64 = FUSE_ASYNC_READ | FUSE_BIG_WRITES | FUSE_HAS_RESEND;
+		flags64 = FUSE_ASYNC_READ | FUSE_BIG_WRITES;
 		out.flags = (uint32_t)flags64;
 		out.flags2 = (uint32_t)(flags64 >> 32);
 		out.max_background = 64;
