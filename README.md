@@ -1,127 +1,126 @@
 # Raw FUSE Parent/Worker Demo
 
-This project is a **direct `/dev/fuse`** failover demo (no libfuse request loop).
-It is meant to validate worker crash/restart semantics with explicit control of
-`FUSE_DEV_IOC_CLONE` and FD handoff.
+This repo demonstrates one thing: **worker crash auto-restart without remount,
+while avoiding permanent connection-dead states (`ENOTCONN`/transport endpoint broken)**.
 
-## Goal
+The implementation is direct `/dev/fuse` protocol handling (no libfuse request loop).
 
-Build a process model where:
+## Core Objective
 
-1. Parent mounts once and keeps the mount alive.
-2. Parent does not process requests.
-3. Worker process handles requests via a cloned `fuse_dev` fd.
-4. If worker crashes, parent starts a new worker without remount.
+1. Parent mounts once and keeps mount lifetime stable.
+2. Worker handles requests on a dedicated cloned `fuse_dev` fd.
+3. Worker can die (`SIGKILL`) and be replaced immediately.
+4. New worker should continue serving new requests without requiring remount.
 
-## Why This Design
+## Restart Flow (Important)
 
-### 1) Keep a dedicated keeper fd open in parent
-If the last `/dev/fuse` device is closed, kernel aborts the connection.
-Kernel path:
-- `fs/fuse/dev.c:fuse_dev_release()` decrements `fc->dev_count`
-- if it reaches zero, `fuse_abort_conn(fc)` is called
-- code pointer: `dev.c:2552-2556`
+```text
+Parent:
+  open /dev/fuse -> mount -> keep master_fd open forever (keeper)
 
-So parent keeps `master_fd` open as a lifecycle anchor.
+Loop:
+  clone worker fd via ioctl(FUSE_DEV_IOC_CLONE)
+  fork worker
+  pass cloned fd to worker via SCM_RIGHTS
+  close parent's copy of that worker fd
+  wait worker exit
+  repeat
 
-### 2) Use `ioctl(FUSE_DEV_IOC_CLONE)` per worker instance
-Each worker gets its own `fuse_dev` (its own processing queue context) instead
-of sharing one open-file-description across generations.
+Worker:
+  recv fd
+  read/write /dev/fuse protocol loop
+  if killed/crash -> process exits, fd closes, kernel releases that fuse_dev
+```
 
-Kernel-side release behavior for a dead worker channel:
-- `fuse_dev_release()` moves that device's `processing` requests to `to_end`
-  (`dev.c:2547`)
-- then `fuse_dev_end_requests()` marks them `-ECONNABORTED`
-  (`dev.c:2406-2414`)
+Why this flow matters:
+- Parent keeper fd prevents “last device closed -> full connection abort”.
+- Per-worker cloned fd isolates worker generation state.
+- Parent closing its worker-fd copy ensures worker death really releases that
+  worker `fuse_dev` in kernel.
 
-This isolates cleanup to the dead worker's channel and avoids mixing old/new
-worker state on the same device endpoint.
+## Why `ioctl(FUSE_DEV_IOC_CLONE)` (not plain fd duplication)
 
-### 3) Pass cloned worker fd with `SCM_RIGHTS`
-Parent clones, passes fd to child, then closes its own copy of that worker fd.
-This ensures worker death actually releases that `fuse_dev` and triggers kernel
-cleanup for requests owned by that worker channel.
+`dup()`/inheritance keeps the same open-file-description and effectively the same
+`fuse_dev` endpoint. For crash failover that is harder to reason about.
 
-### 4) Send `FUSE_NOTIFY_RESEND` after worker exit
-Parent sends unsolicited notify (`out_header.unique=0`) with
-`error=FUSE_NOTIFY_RESEND`.
+`FUSE_DEV_IOC_CLONE` gives each worker its own `fuse_dev` endpoint, so cleanup on
+worker death is localized.
 
-Protocol and kernel pointers:
-- notify code: `include/uapi/linux/fuse.h:675-684`
-- `FUSE_NOTIFY_RESEND = 7`: `fuse.h:682`
-- notify dispatch for `unique == 0`: `dev.c:2200-2205`
-- resend handler: `fuse_resend()` `dev.c:1991-2033`
-- resend marker bit: `FUSE_UNIQUE_RESEND` `fuse.h:1017`
+Kernel pointers:
+- worker fd release path: `fs/fuse/dev.c:fuse_dev_release()` (`dev.c:2534+`)
+- dead worker processing requests are ended: `dev.c:2547`, `dev.c:2550`
+- ended with `-ECONNABORTED`: `fuse_dev_end_requests()` (`dev.c:2406-2414`)
+- last device close aborts whole connection: `dev.c:2552-2556`
+
+## RESEND Policy (Current Repo)
+
+`FUSE_NOTIFY_RESEND` is intentionally **disabled** in this repo.
+
+Reason:
+- It can replay old request identity/state across worker generations.
+- In complex filesystems this interacts badly with inode lifecycle/reuse and
+  increases correctness burden.
+
+Current policy is simpler and explicit:
+1. Crash-window in-flight requests may fail.
+2. New worker serves new requests.
+3. No replay of pre-crash requests.
+
+Reference pointers (if you later want to re-enable resend):
+- `FUSE_NOTIFY_RESEND` enum: `include/uapi/linux/fuse.h:682`
+- notify dispatch (`unique == 0`): `fs/fuse/dev.c:2200-2205`
+- resend handler: `fs/fuse/dev.c:1991-2033`
+- resend bit: `FUSE_UNIQUE_RESEND` `fuse.h:1017`
 - capability bit: `FUSE_HAS_RESEND` `fuse.h:492`
 
-Important: resend can only requeue requests that are still in processing lists
-when it runs. Requests already ended during `fuse_dev_release()` are gone.
+## Failure Behavior Cheat Sheet
 
-## Runtime Behavior You Should Expect
+| Symptom | Meaning in this model | Expected? | What to do |
+|---|---|---|---|
+| one-time `Input/output error` right after killing worker | request was in-flight during crash window, got failed during worker-fd release | Yes | retry command; verify new worker logs appear |
+| persistent `Transport endpoint is not connected` / `ENOTCONN` | whole FUSE connection likely aborted (keeper broken / last device closed) | No | restart demo; verify parent keeper fd never exits |
+| worker reply write `ENOENT` | reply unique not present in current processing queue | Possible around crash boundary | correlate with crash timing; treat as old request completion race |
+| shell still acts weird until `cd` | cwd/path refs may be stale after disruption | Sometimes | `cd / && cd <mount>`; this should be exceptional, not steady-state |
 
-When killing a worker with `SIGKILL`:
+Design target: after worker restart, **new requests keep working without remount**.
 
-1. Some in-flight operations may fail once (typically visible as I/O errors in
-   client syscalls that were already outstanding).
-2. Parent logs worker death and spawns new worker (no resend in current build).
-3. New requests should be handled by the new worker.
-
-If you see persistent errors after restart, check whether they are new requests
-or retries of requests that were in-flight during crash window.
-
-## Build
+## Build / Run
 
 ```bash
 make build
+make run MOUNTPOINT=/tmp/fuse-clone-demo
 ```
 
-## Run
+`run` uses `sudo` because this demo calls `mount(2)` directly and typically needs
+`CAP_SYS_ADMIN`.
+
+## Crash Test
+
+Shell A:
 
 ```bash
 make run MOUNTPOINT=/tmp/fuse-clone-demo
 ```
 
-`run` uses `sudo` in Makefile because this demo uses `mount(2)` directly and
-usually needs `CAP_SYS_ADMIN`.
-
-## Crash/Failover Test
-
-In shell A:
-
-```bash
-make run MOUNTPOINT=/tmp/fuse-clone-demo
-```
-
-In shell B:
+Shell B:
 
 ```bash
 ls -la /tmp/fuse-clone-demo
 cat /tmp/fuse-clone-demo/hello
-```
-
-Kill current worker (not parent):
-
-```bash
 kill -9 <worker_pid_from_logs>
+ls -la /tmp/fuse-clone-demo
+cat /tmp/fuse-clone-demo/hello
 ```
 
-Then run `ls`/`cat` again and verify new worker logs appear.
+Pass condition:
+- worker is respawned by parent
+- transient failure may happen at kill edge
+- subsequent new requests succeed without remount
 
-## Debug Tips
-
-1. Distinguish one-shot crash-window failure vs persistent failure.
-2. Watch for reply write failures (`ENOENT`) as a sign the request unique is no
-   longer present in that worker's processing queue.
-3. If mount is stuck after abnormal exit:
+## Cleanup
 
 ```bash
 fusermount3 -uz /tmp/fuse-clone-demo
 # or
 sudo umount -l /tmp/fuse-clone-demo
 ```
-
-## Scope / Limitations
-
-This is a minimal protocol demo, not a production filesystem.
-Implemented opcodes are intentionally small (INIT, LOOKUP, GETATTR,
-OPENDIR/READDIR, OPEN/READ, plus a few no-op replies).
