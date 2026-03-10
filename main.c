@@ -36,6 +36,22 @@ static char k_hello_str[512];
 static volatile sig_atomic_t g_stop;
 static volatile sig_atomic_t g_sigint_count;
 
+struct fuse_init_record {
+	bool seen;
+	uint32_t in_major;
+	uint32_t in_minor;
+	uint32_t in_max_readahead;
+	uint32_t in_flags;
+	uint32_t out_major;
+	uint32_t out_minor;
+	uint32_t out_max_readahead;
+	uint64_t out_flags;
+	uint32_t out_max_write;
+	uint16_t out_max_pages;
+};
+
+static struct fuse_init_record g_init_record;
+
 struct fuse_req_view {
 	struct fuse_in_header ih;
 	const uint8_t *payload;
@@ -272,10 +288,28 @@ static int handle_request(int fd, const struct fuse_req_view *rq)
 		out.max_write = 128 * 1024;
 		out.time_gran = 1;
 		out.max_pages = 32;
+		g_init_record.seen = true;
+		g_init_record.in_major = in->major;
+		g_init_record.in_minor = in->minor;
+		g_init_record.in_max_readahead = in->max_readahead;
+		g_init_record.in_flags = in->flags;
+		g_init_record.out_major = out.major;
+		g_init_record.out_minor = out.minor;
+		g_init_record.out_max_readahead = out.max_readahead;
+		g_init_record.out_flags = flags64;
+		g_init_record.out_max_write = out.max_write;
+		g_init_record.out_max_pages = out.max_pages;
 
 		iov.iov_base = &out;
 		iov.iov_len = sizeof(out);
-		LOGF("INIT major=%u minor=%u", in->major, in->minor);
+		LOGF("INIT in={major=%u minor=%u max_readahead=%u flags=0x%x} "
+		     "out={major=%u minor=%u max_readahead=%u flags=0x%llx max_write=%u max_pages=%u}",
+		     g_init_record.in_major, g_init_record.in_minor,
+		     g_init_record.in_max_readahead, g_init_record.in_flags,
+		     g_init_record.out_major, g_init_record.out_minor,
+		     g_init_record.out_max_readahead,
+		     (unsigned long long)g_init_record.out_flags,
+		     g_init_record.out_max_write, g_init_record.out_max_pages);
 		return send_out_iov(fd, 0, rq->ih.unique, &iov, 1);
 	}
 	case FUSE_LOOKUP: {
